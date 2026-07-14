@@ -17,6 +17,7 @@ SOCIAL_HOSTS = ("vk.com", "t.me", "telegram.me", "instagram.com", "facebook.com"
 OVERPASS_ENDPOINTS = (
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
     "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
 )
 PRESETS: dict[str, tuple[tuple[str, str], ...]] = {
     "Ремонт и отделка": (
@@ -65,6 +66,14 @@ EXPORT_FIELDS = (
     "note",
     "source",
     "source_url",
+    "need_score",
+    "contact_score",
+    "verification_status",
+    "verification_evidence",
+    "website_source",
+    "branch_count",
+    "latitude",
+    "longitude",
 )
 
 
@@ -77,6 +86,7 @@ class WebsiteAudit:
     mobile_viewport: bool | None = None
     title_present: bool | None = None
     description_present: bool | None = None
+    contact_action: bool | None = None
     mobile_score: int | None = None
     error: str = ""
 
@@ -94,6 +104,14 @@ class Lead:
     website: str = ""
     source: str = ""
     source_url: str = ""
+    latitude: float | None = None
+    longitude: float | None = None
+    website_source: str = ""
+    verification_status: str = "ambiguous"
+    verification_evidence: list[str] = field(default_factory=list)
+    need_score: int = 0
+    contact_score: int = 0
+    branch_count: int = 1
     score: int = 0
     reasons: list[str] = field(default_factory=list)
     status: str = "Новый"
@@ -116,6 +134,7 @@ class _SignalsParser(HTMLParser):
         self.title_text: list[str] = []
         self.mobile_viewport = False
         self.description_present = False
+        self.contact_action = False
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = {key.lower(): (value or "") for key, value in attrs}
@@ -128,6 +147,14 @@ class _SignalsParser(HTMLParser):
                 self.mobile_viewport = True
             if name == "description" and content:
                 self.description_present = True
+        if tag.lower() == "form":
+            self.contact_action = True
+        if tag.lower() == "a":
+            href = attributes.get("href", "").lower()
+            if href.startswith(("tel:", "mailto:")) or any(
+                word in href for word in ("contact", "контакт", "booking", "appointment", "запис")
+            ):
+                self.contact_action = True
 
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() == "title":
@@ -156,11 +183,11 @@ def normalize_website(value: str) -> WebsiteAudit:
     return WebsiteAudit(state="unknown", normalized_url=url, https=parsed.scheme == "https")
 
 
-def _parse_html_signals(html: str) -> tuple[bool, bool, bool]:
+def _parse_html_signals(html: str) -> tuple[bool, bool, bool, bool]:
     parser = _SignalsParser()
     parser.feed(html or "")
     title_present = bool("".join(parser.title_text).strip())
-    return parser.mobile_viewport, title_present, parser.description_present
+    return parser.mobile_viewport, title_present, parser.description_present, parser.contact_action
 
 
 def apply_pagespeed_result(audit: WebsiteAudit, data: dict[str, Any]) -> WebsiteAudit:
@@ -199,7 +226,7 @@ def audit_website(
     if audit.state != "unknown":
         return audit
 
-    client = session or requests.Session()
+    client = session or requests
     raw = value.strip()
     urls = [audit.normalized_url]
     if "://" not in raw:
@@ -231,7 +258,7 @@ def audit_website(
                 status=response.status_code,
             )
         if 200 <= response.status_code < 400:
-            viewport, title, description = _parse_html_signals(response.text)
+            viewport, title, description, contact_action = _parse_html_signals(response.text)
             result = WebsiteAudit(
                 state="reachable",
                 normalized_url=final_url,
@@ -240,6 +267,7 @@ def audit_website(
                 mobile_viewport=viewport,
                 title_present=title,
                 description_present=description,
+                contact_action=contact_action,
             )
             return _check_pagespeed(result, pagespeed_key, client) if pagespeed_key else result
 
@@ -248,18 +276,24 @@ def audit_website(
     return WebsiteAudit(state="broken", normalized_url=audit.normalized_url, status=last_status)
 
 
-def score_lead(lead: Lead, audit: WebsiteAudit) -> tuple[int, list[str]]:
+def score_components(lead: Lead, audit: WebsiteAudit) -> tuple[int, int, list[str]]:
     need_score = 0
     reasons: list[str] = []
 
     if audit.state == "missing":
-        need_score = 60
-        reasons.append("сайт не указан в источнике")
+        if lead.verification_status == "confirmed_no_site":
+            need_score = 70
+            reasons.append("отсутствие сайта подтверждено")
+        elif lead.verification_status == "likely_no_site":
+            need_score = 45
+            reasons.append("сайт не найден, требуется подтверждение")
+        else:
+            reasons.append("сайт не указан в источнике, требуется проверка")
     elif audit.state == "social":
-        need_score = 45
+        need_score = 50
         reasons.append("вместо сайта соцсеть")
     elif audit.state == "broken":
-        need_score = 50
+        need_score = 60
         reasons.append("сайт не открывается")
     elif audit.state == "unknown":
         reasons.append("сайт не удалось проверить")
@@ -279,6 +313,9 @@ def score_lead(lead: Lead, audit: WebsiteAudit) -> tuple[int, list[str]]:
             if audit.description_present is False:
                 need_score += 5
                 reasons.append("нет description")
+            if audit.contact_action is False:
+                need_score += 15
+                reasons.append("нет действия для клиента")
             if audit.mobile_score is not None and audit.mobile_score < 50:
                 need_score += 10
                 reasons.append("низкая мобильная скорость")
@@ -297,7 +334,12 @@ def score_lead(lead: Lead, audit: WebsiteAudit) -> tuple[int, list[str]]:
         contact_score += 5
         reasons.append("есть соцсеть/мессенджер")
 
-    return min(100, min(70, need_score) + min(30, contact_score)), reasons
+    return min(70, need_score), min(30, contact_score), reasons
+
+
+def score_lead(lead: Lead, audit: WebsiteAudit) -> tuple[int, list[str]]:
+    need_score, contact_score, reasons = score_components(lead, audit)
+    return min(100, need_score + contact_score), reasons
 
 
 def _confirmed_problem(audit: WebsiteAudit) -> str:
@@ -351,8 +393,8 @@ def build_overpass_query(
     bbox: tuple[float, float, float, float],
     limit: int,
 ) -> str:
-    if not 1 <= limit <= 200:
-        raise ValueError("Лимит должен быть от 1 до 200.")
+    if not 1 <= limit <= 1000:
+        raise ValueError("Лимит должен быть от 1 до 1000.")
     south, west, north, east = bbox
     box = f"{south},{west},{north},{east}"
     escaped = re.escape(keyword.strip())
@@ -370,6 +412,10 @@ def build_overpass_query(
         raise ValueError("Выберите пресет или укажите ключевое слово для другой ниши.")
 
     return "[out:json][timeout:25];\n(\n  " + "\n  ".join(selectors) + f"\n);\nout center {limit} tags;"
+
+
+def overpass_source_limit(limit: int) -> int:
+    return min(max(limit * 5, 200), 1000)
 
 
 def _first(tags: dict[str, Any], *names: str) -> str:
@@ -403,6 +449,8 @@ def parse_osm_elements(payload: dict[str, Any], city: str) -> list[Lead]:
         category = _first(tags, "craft", "shop", "office", "amenity", "healthcare")
         element_type = str(element.get("type", "node"))
         element_id = str(element.get("id", ""))
+        center = element.get("center") or {}
+        website = _first(tags, "contact:website", "website", "url")
         leads.append(
             Lead(
                 lead_key=f"osm:{element_type}:{element_id}",
@@ -413,16 +461,77 @@ def parse_osm_elements(payload: dict[str, Any], city: str) -> list[Lead]:
                 phone=_first(tags, "contact:phone", "phone"),
                 email=_first(tags, "contact:email", "email"),
                 social=_normalize_social(tags),
-                website=_first(tags, "contact:website", "website", "url"),
+                website=website,
                 source="OpenStreetMap",
                 source_url=f"https://www.openstreetmap.org/{element_type}/{element_id}",
+                latitude=element.get("lat", center.get("lat")),
+                longitude=element.get("lon", center.get("lon")),
+                website_source="OpenStreetMap" if website else "",
+                verification_status="source_provided" if website else "ambiguous",
             )
         )
     return leads
 
 
+def _domain(value: str) -> str:
+    audit = normalize_website(value)
+    if audit.state in ("missing", "broken", "social"):
+        return ""
+    return urlparse(audit.normalized_url).netloc.lower().split(":", 1)[0].removeprefix("www.")
+
+
+def _phone_key(value: str) -> str:
+    digits = re.sub(r"\D", "", value or "")
+    return digits[-10:] if len(digits) >= 10 else ""
+
+
+def _name_key(value: str) -> str:
+    return "".join(re.findall(r"[a-zа-яё0-9]+", (value or "").lower()))
+
+
+def deduplicate_leads(leads: list[Lead]) -> list[Lead]:
+    result: list[Lead] = []
+    indexes: dict[str, int] = {}
+    for lead in leads:
+        domain = _domain(lead.website)
+        phone = _phone_key(lead.phone)
+        name = _name_key(lead.name)
+        key = f"domain:{domain}" if domain else f"phone:{phone}:{name}" if phone and name else f"lead:{lead.lead_key}"
+        if key not in indexes:
+            indexes[key] = len(result)
+            result.append(lead)
+            continue
+
+        saved = result[indexes[key]]
+        saved.branch_count += max(1, lead.branch_count)
+        for field_name in ("phone", "email", "social", "website", "website_source"):
+            if not getattr(saved, field_name) and getattr(lead, field_name):
+                setattr(saved, field_name, getattr(lead, field_name))
+        saved.verification_evidence.extend(
+            item for item in lead.verification_evidence if item not in saved.verification_evidence
+        )
+    return result
+
+
+def filter_and_limit_leads(leads: list[Lead], only_with_contacts: bool, limit: int) -> list[Lead]:
+    filtered = leads
+    if only_with_contacts:
+        filtered = [lead for lead in filtered if lead.phone or lead.email or lead.social or lead.website]
+    return sorted(filtered, key=lambda item: item.score, reverse=True)[:limit]
+
+
+def lead_queue(lead: Lead) -> str:
+    if lead.verification_status == "confirmed_no_site":
+        return "ready"
+    if lead.verification_status in ("source_provided", "site_found") and lead.need_score >= 20:
+        return "ready"
+    if lead.verification_status in ("likely_no_site", "ambiguous", "verification_error"):
+        return "confirmation"
+    return "all"
+
+
 def resolve_city_bbox(city: str, session: requests.Session | None = None) -> tuple[float, float, float, float]:
-    client = session or requests.Session()
+    client = session or requests
     response = client.get(
         "https://nominatim.openstreetmap.org/search",
         params={
@@ -449,13 +558,16 @@ def collect_osm(
     limit: int = 50,
     only_with_contacts: bool = True,
     session: requests.Session | None = None,
+    bbox: tuple[float, float, float, float] | None = None,
 ) -> list[Lead]:
-    client = session or requests.Session()
-    try:
-        bbox = resolve_city_bbox(city, client)
-    except requests.RequestException as error:
-        raise RuntimeError(f"Не удалось определить границы города: {error}") from error
-    query = build_overpass_query(preset, keyword, bbox, limit)
+    client = session or requests
+    if bbox is None:
+        try:
+            bbox = resolve_city_bbox(city, client)
+        except requests.RequestException as error:
+            raise RuntimeError(f"Не удалось определить границы города: {error}") from error
+    source_limit = overpass_source_limit(limit)
+    query = build_overpass_query(preset, keyword, bbox, source_limit)
     last_error: Exception | None = None
     payload: dict[str, Any] | None = None
 
@@ -476,23 +588,45 @@ def collect_osm(
     if payload is None:
         raise RuntimeError(f"Источники OpenStreetMap недоступны: {last_error}")
 
-    leads = parse_osm_elements(payload, city)
+    leads = deduplicate_leads(parse_osm_elements(payload, city))
     if only_with_contacts:
         leads = [lead for lead in leads if lead.phone or lead.email or lead.social or lead.website]
-    return leads[:limit]
+        return leads[:limit]
+    return leads[:source_limit]
 
 
 def enrich_leads(
     leads: list[Lead],
     pagespeed_key: str = "",
     audit_func: Any = audit_website,
+    crawl_func: Any | None = None,
 ) -> list[Lead]:
     def enrich(lead: Lead) -> Lead:
         audit = audit_func(lead.website or lead.social, pagespeed_key=pagespeed_key)
         lead.audit = audit
         if lead.website and audit.normalized_url:
             lead.website = audit.normalized_url
-        lead.score, lead.reasons = score_lead(lead, audit)
+        if crawl_func and lead.website and audit.state == "reachable":
+            contacts = crawl_func(lead.website)
+            for field_name in ("phone", "email", "social"):
+                if not getattr(lead, field_name) and contacts.get(field_name):
+                    setattr(lead, field_name, str(contacts[field_name]))
+            audit.contact_action = bool(
+                audit.contact_action
+                or contacts.get("has_form")
+                or contacts.get("contact_page")
+                or contacts.get("online_booking")
+                or contacts.get("phone")
+                or contacts.get("email")
+            )
+            if contacts.get("contact_page"):
+                lead.verification_evidence.append(f"найдена страница контактов: {contacts['contact_page']}")
+            if contacts.get("has_form"):
+                lead.verification_evidence.append("на сайте найдена форма")
+            if contacts.get("online_booking"):
+                lead.verification_evidence.append("найдена онлайн-запись")
+        lead.need_score, lead.contact_score, lead.reasons = score_components(lead, audit)
+        lead.score = min(100, lead.need_score + lead.contact_score)
         return lead
 
     with ThreadPoolExecutor(max_workers=min(5, max(1, len(leads)))) as executor:
@@ -502,14 +636,15 @@ def enrich_leads(
 
 def dry_run_leads() -> list[Lead]:
     samples = [
-        (Lead(name="Мастер окон", lead_key="dry:1", category="Окна", city="Екатеринбург", phone="+7 343 000-00-01", source="Dry Run"), WebsiteAudit(state="missing")),
-        (Lead(name="Сантехник рядом", lead_key="dry:2", category="Сантехники", city="Екатеринбург", phone="+7 343 000-00-02", social="https://vk.com/santeh", website="https://vk.com/santeh", source="Dry Run"), WebsiteAudit(state="social", normalized_url="https://vk.com/santeh", https=True)),
-        (Lead(name="Урал-Сервис", lead_key="dry:3", category="Ремонт", city="Екатеринбург", email="info@example.ru", website="http://example.ru", source="Dry Run"), WebsiteAudit(state="reachable", normalized_url="http://example.ru", https=False, mobile_viewport=False, title_present=True, description_present=False)),
+        (Lead(name="Мастер окон", lead_key="dry:1", category="Окна", city="Екатеринбург", phone="+7 343 000-00-01", source="Dry Run", verification_status="confirmed_no_site"), WebsiteAudit(state="missing")),
+        (Lead(name="Сантехник рядом", lead_key="dry:2", category="Сантехники", city="Екатеринбург", phone="+7 343 000-00-02", social="https://vk.com/santeh", website="https://vk.com/santeh", source="Dry Run", verification_status="source_provided"), WebsiteAudit(state="social", normalized_url="https://vk.com/santeh", https=True)),
+        (Lead(name="Урал-Сервис", lead_key="dry:3", category="Ремонт", city="Екатеринбург", email="info@example.ru", website="http://example.ru", source="Dry Run", verification_status="source_provided"), WebsiteAudit(state="reachable", normalized_url="http://example.ru", https=False, mobile_viewport=False, title_present=True, description_present=False, contact_action=False)),
     ]
     result: list[Lead] = []
     for lead, audit in samples:
         lead.audit = audit
-        lead.score, lead.reasons = score_lead(lead, audit)
+        lead.need_score, lead.contact_score, lead.reasons = score_components(lead, audit)
+        lead.score = min(100, lead.need_score + lead.contact_score)
         result.append(lead)
     return sorted(result, key=lambda item: item.score, reverse=True)
 
@@ -531,7 +666,12 @@ def lead_from_row(row: dict[str, Any]) -> Lead | None:
     values = {field: clean_cell(row.get(field)) for field in INPUT_FIELDS}
     if not values["name"]:
         return None
-    return Lead(lead_key=_fallback_key(values), **values)
+    return Lead(
+        lead_key=_fallback_key(values),
+        **values,
+        website_source=values["source"] if values["website"] else "",
+        verification_status="source_provided" if values["website"] else "ambiguous",
+    )
 
 
 def import_csv(path_or_file: str | io.BytesIO) -> list[Lead]:
@@ -573,12 +713,15 @@ def import_xlsx(path_or_file: str | io.BytesIO) -> list[Lead]:
 
 
 def lead_to_export_row(lead: Lead) -> dict[str, Any]:
-    return {
+    row = {
         "score": lead.score,
         "priority": lead.priority,
         "reasons": "; ".join(lead.reasons),
-        **{field: getattr(lead, field) for field in EXPORT_FIELDS[3:]},
     }
+    for field_name in EXPORT_FIELDS[3:]:
+        value = getattr(lead, field_name)
+        row[field_name] = "; ".join(value) if isinstance(value, list) else value
+    return row
 
 
 def export_csv_bytes(leads: list[Lead]) -> bytes:

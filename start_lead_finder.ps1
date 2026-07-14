@@ -23,6 +23,8 @@ try {
         Remove-Item -LiteralPath $pidFile -Force
     }
 
+    $env:YANDEX_SEARCH_API_KEY = [Environment]::GetEnvironmentVariable('YANDEX_SEARCH_API_KEY', 'User')
+    $env:YANDEX_FOLDER_ID = [Environment]::GetEnvironmentVariable('YANDEX_FOLDER_ID', 'User')
     $launcher = (Get-Command py.exe -ErrorAction Stop).Source
     $process = Start-Process -FilePath $launcher `
         -ArgumentList @("-3.14", "-m", "streamlit", "run", "app.py", "--server.headless=true", "--server.port=$port", "--browser.gatherUsageStats=false") `
