@@ -1,18 +1,24 @@
 import base64
+import os
+import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import requests
 
 from lead_finder import Lead, WebsiteAudit
+from storage import LeadStore
 from verification import (
+    VerificationResult,
     calculate_request_allowance,
     candidate_matches,
     check_yandex_connection,
     crawl_contacts,
+    domain_verification_key,
     is_excluded_result,
     parse_yandex_xml,
     verify_lead_site,
+    verify_lead_site_cached,
     verify_missing_leads,
 )
 
@@ -33,6 +39,128 @@ class FakeResponse:
 
 
 class VerificationTests(unittest.TestCase):
+    def test_domain_verification_key_is_stable_and_uses_address_without_full_phone(self):
+        first = Lead(
+            name="  Альфа-Дент ",
+            city="ЕКАТЕРИНБУРГ",
+            phone="+7 (343) 222-11-00",
+            address="Ленина, 10",
+        )
+        same_company = Lead(
+            name="альфа дент",
+            city=" екатеринбург ",
+            phone="8 343 222 1100",
+            address="Другой адрес филиала",
+        )
+        no_phone_first = Lead(name="Компания", city="Пермь", address="Ленина, 1")
+        no_phone_second = Lead(name="Компания", city="Пермь", address="Ленина, 2")
+
+        self.assertEqual(domain_verification_key(first), domain_verification_key(same_company))
+        self.assertNotEqual(
+            domain_verification_key(no_phone_first),
+            domain_verification_key(no_phone_second),
+        )
+
+    def test_cached_verification_works_without_credentials_network_or_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LeadStore(os.path.join(tmp, "leads.db"))
+            lead = Lead(name="Компания", city="Екатеринбург", phone="+7 343 000-00-00")
+            store.save_domain_verification(
+                domain_verification_key(lead),
+                "likely_no_site",
+                "",
+                ["официальный сайт не найден"],
+            )
+            session = Mock()
+
+            result, stats = verify_missing_leads(
+                [lead], "", "", max_requests=0, session=session, store=store
+            )
+
+        self.assertEqual(result[0].verification_status, "likely_no_site")
+        self.assertEqual(stats["api_requests"], 0)
+        self.assertEqual(stats["cache_hits"], 1)
+        session.post.assert_not_called()
+
+    def test_cached_wrapper_skips_network_and_marks_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LeadStore(os.path.join(tmp, "leads.db"))
+            lead = Lead(name="Компания", city="Екатеринбург")
+            store.save_domain_verification(
+                domain_verification_key(lead),
+                "site_found",
+                "https://company.ru",
+                ["совпало название и город"],
+            )
+            session = Mock()
+
+            result = verify_lead_site_cached(lead, "", "", store, session=session)
+
+        self.assertTrue(result.from_cache)
+        self.assertEqual(result.api_requests, 0)
+        self.assertEqual(result.website, "https://company.ru")
+        session.post.assert_not_called()
+
+    def test_cached_wrapper_saves_only_reliable_results(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LeadStore(os.path.join(tmp, "leads.db"))
+            for status in ("ambiguous", "verification_error"):
+                lead = Lead(name=f"Компания {status}", city="Екатеринбург")
+                with patch(
+                    "verification.verify_lead_site",
+                    return_value=VerificationResult(status, api_requests=1),
+                ):
+                    verify_lead_site_cached(lead, "key", "folder", store)
+                self.assertIsNone(
+                    store.get_domain_verification(domain_verification_key(lead))
+                )
+
+    def test_force_refresh_replaces_cache_only_with_reliable_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LeadStore(os.path.join(tmp, "leads.db"))
+            lead = Lead(name="Компания", city="Екатеринбург")
+            key = domain_verification_key(lead)
+            store.save_domain_verification(key, "likely_no_site", "", ["старый результат"])
+
+            with patch(
+                "verification.verify_lead_site",
+                return_value=VerificationResult(
+                    "site_found", "https://company.ru", ["совпал телефон"], 1
+                ),
+            ):
+                refreshed = verify_lead_site_cached(
+                    lead, "key", "folder", store, force_refresh=True
+                )
+
+            self.assertFalse(refreshed.from_cache)
+            self.assertEqual(store.get_domain_verification(key)["website"], "https://company.ru")
+
+            with patch(
+                "verification.verify_lead_site",
+                return_value=VerificationResult("verification_error", api_requests=1),
+            ):
+                verify_lead_site_cached(lead, "key", "folder", store, force_refresh=True)
+
+            self.assertEqual(store.get_domain_verification(key)["website"], "https://company.ru")
+
+    def test_dry_run_does_not_read_or_write_domain_cache(self):
+        store = Mock()
+        session = Mock()
+
+        verify_missing_leads(
+            [Lead(name="Компания")],
+            "key",
+            "folder",
+            max_requests=1,
+            dry_run=True,
+            session=session,
+            store=store,
+        )
+
+        store.get_domain_verification.assert_not_called()
+        store.save_domain_verification.assert_not_called()
+        session.post.assert_not_called()
+
     def test_connection_check_requires_credentials_without_network(self):
         session = Mock()
 

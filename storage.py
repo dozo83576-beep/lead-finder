@@ -103,8 +103,27 @@ class LeadStore:
                     sites_found INTEGER NOT NULL DEFAULT 0,
                     ready_leads INTEGER NOT NULL DEFAULT 0,
                     api_requests INTEGER NOT NULL DEFAULT 0,
+                    cache_hits INTEGER NOT NULL DEFAULT 0,
                     estimated_cost REAL NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            search_run_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(search_runs)")
+            }
+            if "cache_hits" not in search_run_columns:
+                connection.execute(
+                    "ALTER TABLE search_runs ADD COLUMN cache_hits INTEGER NOT NULL DEFAULT 0"
+                )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS domain_verification_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    website TEXT NOT NULL DEFAULT '',
+                    evidence_json TEXT NOT NULL DEFAULT '[]',
+                    checked_at TEXT NOT NULL
                 )
                 """
             )
@@ -256,6 +275,62 @@ class LeadStore:
             return None
         return row["south"], row["west"], row["north"], row["east"]
 
+    def get_domain_verification(
+        self,
+        cache_key: str,
+        max_age_days: int = 90,
+    ) -> dict[str, object] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT status, website, evidence_json, checked_at
+                FROM domain_verification_cache
+                WHERE cache_key = ?
+                """,
+                (cache_key,),
+            ).fetchone()
+        if not row:
+            return None
+        checked_at = datetime.fromisoformat(row["checked_at"])
+        if checked_at.tzinfo is None:
+            checked_at = checked_at.replace(tzinfo=timezone.utc)
+        if checked_at < datetime.now(timezone.utc) - timedelta(days=max_age_days):
+            return None
+        return {
+            "status": row["status"],
+            "website": row["website"],
+            "evidence": json.loads(row["evidence_json"]),
+            "checked_at": row["checked_at"],
+        }
+
+    def save_domain_verification(
+        self,
+        cache_key: str,
+        status: str,
+        website: str,
+        evidence: list[str],
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO domain_verification_cache (
+                    cache_key, status, website, evidence_json, checked_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    status = excluded.status,
+                    website = excluded.website,
+                    evidence_json = excluded.evidence_json,
+                    checked_at = excluded.checked_at
+                """,
+                (
+                    cache_key,
+                    status,
+                    website,
+                    json.dumps(evidence, ensure_ascii=False),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
     def record_search_run(
         self,
         city: str,
@@ -266,16 +341,27 @@ class LeadStore:
         ready_leads: int,
         api_requests: int,
         estimated_cost: float,
+        cache_hits: int = 0,
     ) -> None:
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO search_runs (
                     city, preset, osm_found, yandex_checked, sites_found,
-                    ready_leads, api_requests, estimated_cost
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ready_leads, api_requests, cache_hits, estimated_cost
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (city, preset, osm_found, yandex_checked, sites_found, ready_leads, api_requests, estimated_cost),
+                (
+                    city,
+                    preset,
+                    osm_found,
+                    yandex_checked,
+                    sites_found,
+                    ready_leads,
+                    api_requests,
+                    cache_hits,
+                    estimated_cost,
+                ),
             )
 
     def list_search_runs(self, limit: int = 10) -> list[dict[str, object]]:

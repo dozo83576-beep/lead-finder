@@ -30,9 +30,10 @@ from verification import (
     calculate_request_allowance,
     check_yandex_connection,
     crawl_contacts,
+    domain_verification_key,
     estimated_cost,
     manual_yandex_search_url,
-    verify_lead_site,
+    verify_lead_site_cached,
     verify_missing_leads,
 )
 
@@ -185,6 +186,7 @@ if search_clicked:
                 yandex_api_key,
                 yandex_folder_id,
                 max_requests=allowed_requests,
+                store=store,
             )
             for lead in verified:
                 if lead.audit is not None:
@@ -212,13 +214,15 @@ if search_clicked:
                 ready_leads=ready_count,
                 api_requests=api_stats["api_requests"],
                 estimated_cost=run_cost,
+                cache_hits=api_stats.get("cache_hits", 0),
             )
             st.session_state.leads = store.list_leads()
             st.session_state.dry_results = False
             logging.info(
-                "Поиск завершён: OSM=%s, Яндекс=%s, сайты=%s, готовые=%s, стоимость=%.3f ₽.",
+                "Поиск завершён: OSM=%s, Яндекс=%s, кэш=%s, сайты=%s, готовые=%s, стоимость=%.3f ₽.",
                 len(found),
                 api_stats["yandex_checked"],
+                api_stats.get("cache_hits", 0),
                 api_stats["sites_found"],
                 ready_count,
                 run_cost,
@@ -368,17 +372,37 @@ if not st.session_state.dry_results:
             store.monthly_yandex_requests(),
             1,
         )
-        st.caption("Поиск актуального домена использует один запрос и учитывается в месячном бюджете.")
-        if st.button(
+        cached_domain = store.get_domain_verification(domain_verification_key(selected))
+        st.caption(
+            "Обычная проверка сначала использует бесплатный кэш за 90 дней. "
+            "Принудительная проверка выполняет один платный запрос."
+        )
+        domain_columns = st.columns(2)
+        cached_clicked = domain_columns[0].button(
             "Найти актуальный домен",
             key=f"find_current_site_{selected.lead_key}",
+            disabled=not cached_domain
+            and (not yandex_configured or manual_request_allowed == 0),
+            width="stretch",
+        )
+        force_clicked = domain_columns[1].button(
+            "Проверить заново за 1 запрос",
+            key=f"refresh_current_site_{selected.lead_key}",
             disabled=not yandex_configured or manual_request_allowed == 0,
-        ):
+            width="stretch",
+        )
+        if cached_clicked or force_clicked:
             old_website = selected.website
             old_source = selected.website_source
             old_status = selected.verification_status
             old_audit = selected.audit
-            result = verify_lead_site(selected, yandex_api_key, yandex_folder_id)
+            result = verify_lead_site_cached(
+                selected,
+                yandex_api_key,
+                yandex_folder_id,
+                store,
+                force_refresh=force_clicked,
+            )
             replaced = bool(
                 result.website and website_host(result.website) != website_host(old_website)
             )
@@ -420,6 +444,7 @@ if not st.session_state.dry_results:
                 ready_leads=int(lead_queue(selected) == "ready"),
                 api_requests=result.api_requests,
                 estimated_cost=estimated_cost(result.api_requests, price_per_1000),
+                cache_hits=int(result.from_cache),
             )
             st.session_state.leads = store.list_leads()
 
@@ -458,6 +483,7 @@ if history:
                 "sites_found": "Найдены сайты",
                 "ready_leads": "Готовые лиды",
                 "api_requests": "API-запросы",
+                "cache_hits": "Из кэша",
                 "estimated_cost": "Стоимость, ₽",
             }
         )

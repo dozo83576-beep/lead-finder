@@ -9,7 +9,7 @@ from streamlit.testing.v1 import AppTest
 
 from lead_finder import Lead, WebsiteAudit
 from storage import LeadStore
-from verification import VerificationResult
+from verification import VerificationResult, domain_verification_key
 
 
 class LeadFinderAppTests(unittest.TestCase):
@@ -200,6 +200,129 @@ class LeadFinderAppTests(unittest.TestCase):
                     else:
                         os.environ[name] = value
 
+    def test_manual_domain_search_uses_cache_without_credentials_or_cost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "app.db")
+            store = LeadStore(db_path)
+            lead = Lead(
+                name="Урсула",
+                lead_key="cached",
+                city="Екатеринбург",
+                phone="+7 343 223-04-73",
+                website="http://www.ursula.ru",
+                website_source="OpenStreetMap",
+                verification_status="source_provided",
+                audit=WebsiteAudit(state="reachable", normalized_url="http://www.ursula.ru"),
+            )
+            store.upsert_many([lead])
+            store.save_domain_verification(
+                domain_verification_key(lead),
+                "site_found",
+                "https://www.ursula.pro",
+                ["совпал телефон"],
+            )
+            old_values = {
+                name: os.environ.get(name)
+                for name in ("LEAD_DB_PATH", "LEAD_LOG_PATH", "YANDEX_SEARCH_API_KEY", "YANDEX_FOLDER_ID")
+            }
+            os.environ["LEAD_DB_PATH"] = db_path
+            os.environ["LEAD_LOG_PATH"] = os.path.join(tmp, "app.log")
+            os.environ.pop("YANDEX_SEARCH_API_KEY", None)
+            os.environ.pop("YANDEX_FOLDER_ID", None)
+            try:
+                with (
+                    patch("verification.verify_lead_site") as network_check,
+                    patch("lead_finder.enrich_leads", side_effect=lambda leads, **_kwargs: leads),
+                ):
+                    app = AppTest.from_file(Path(__file__).parents[1] / "app.py", default_timeout=15).run()
+                    app.button(key="find_current_site_cached").click().run()
+
+                saved_store = LeadStore(db_path)
+                saved = saved_store.list_leads()[0]
+                history = saved_store.list_search_runs()
+                self.assertFalse(app.exception)
+                self.assertEqual(saved.website, "https://www.ursula.pro")
+                self.assertEqual(saved_store.monthly_yandex_requests(), 0)
+                self.assertEqual(history[0]["cache_hits"], 1)
+                self.assertTrue(
+                    any("Из кэша" in dataframe.value.columns for dataframe in app.dataframe)
+                )
+                network_check.assert_not_called()
+            finally:
+                logging.shutdown()
+                for name, value in old_values.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+
+    def test_force_domain_search_ignores_cache_and_counts_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "app.db")
+            store = LeadStore(db_path)
+            lead = Lead(
+                name="Урсула",
+                lead_key="force",
+                city="Екатеринбург",
+                phone="+7 343 223-04-73",
+                website="http://www.ursula.ru",
+                website_source="OpenStreetMap",
+                verification_status="source_provided",
+                audit=WebsiteAudit(state="reachable", normalized_url="http://www.ursula.ru"),
+            )
+            store.upsert_many([lead])
+            store.save_domain_verification(
+                domain_verification_key(lead),
+                "likely_no_site",
+                "",
+                ["старый результат"],
+            )
+            old_values = {
+                name: os.environ.get(name)
+                for name in ("LEAD_DB_PATH", "LEAD_LOG_PATH", "YANDEX_SEARCH_API_KEY", "YANDEX_FOLDER_ID")
+            }
+            os.environ.update(
+                {
+                    "LEAD_DB_PATH": db_path,
+                    "LEAD_LOG_PATH": os.path.join(tmp, "app.log"),
+                    "YANDEX_SEARCH_API_KEY": "secret",
+                    "YANDEX_FOLDER_ID": "folder",
+                }
+            )
+            try:
+                with (
+                    patch(
+                        "verification.verify_lead_site",
+                        return_value=VerificationResult(
+                            "site_found",
+                            "https://www.ursula.pro",
+                            ["совпал телефон"],
+                            1,
+                        ),
+                    ),
+                    patch("lead_finder.enrich_leads", side_effect=lambda leads, **_kwargs: leads),
+                ):
+                    app = AppTest.from_file(Path(__file__).parents[1] / "app.py", default_timeout=15).run()
+                    app.button(key="refresh_current_site_force").click().run()
+
+                saved_store = LeadStore(db_path)
+                history = saved_store.list_search_runs()
+                self.assertFalse(app.exception)
+                self.assertEqual(saved_store.list_leads()[0].website, "https://www.ursula.pro")
+                self.assertEqual(saved_store.monthly_yandex_requests(), 1)
+                self.assertEqual(history[0]["cache_hits"], 0)
+                self.assertEqual(
+                    saved_store.get_domain_verification(domain_verification_key(lead))["website"],
+                    "https://www.ursula.pro",
+                )
+            finally:
+                logging.shutdown()
+                for name, value in old_values.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+
     def test_search_audits_old_site_before_yandex_and_reaudits_replacement(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = os.path.join(tmp, "app.db")
@@ -340,12 +463,15 @@ class LeadFinderAppTests(unittest.TestCase):
             os.environ["LEAD_LOG_PATH"] = log_path
             try:
                 app_path = Path(__file__).parents[1] / "app.py"
-                app = AppTest.from_file(app_path, default_timeout=15).run()
-                self.assertEqual(app.title[0].value, "Lead Finder")
-                self.assertTrue(any("около 24.40 ₽" in caption.value for caption in app.caption))
+                with patch("storage.LeadStore.get_domain_verification") as cache_read:
+                    app = AppTest.from_file(app_path, default_timeout=15).run()
+                    self.assertEqual(app.title[0].value, "Lead Finder")
+                    self.assertTrue(any("около 24.40 ₽" in caption.value for caption in app.caption))
 
-                app.checkbox(key="dry_run").check().run()
-                app.button(key="search").click().run()
+                    app.checkbox(key="dry_run").check().run()
+                    app.button(key="search").click().run()
+
+                cache_read.assert_not_called()
 
                 self.assertFalse(app.exception)
                 self.assertIn("Мастер окон", app.dataframe[0].value["Компания"].tolist())

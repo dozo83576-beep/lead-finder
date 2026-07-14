@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import math
 import re
 import xml.etree.ElementTree as ET
@@ -10,6 +11,7 @@ from urllib.robotparser import RobotFileParser
 import requests
 
 from lead_finder import Lead, SOCIAL_HOSTS, USER_AGENT
+from storage import LeadStore
 
 
 YANDEX_SEARCH_URL = "https://searchapi.api.cloud.yandex.net/v2/web/search"
@@ -42,6 +44,7 @@ NAME_STOPWORDS = {
 }
 CONTACT_WORDS = ("contact", "contacts", "kontakty", "контакт", "o-kompanii", "about")
 BOOKING_WORDS = ("booking", "appointment", "запис", "yclients", "dikidi")
+CACHEABLE_STATUSES = {"site_found", "likely_no_site"}
 
 
 @dataclass
@@ -50,6 +53,7 @@ class VerificationResult:
     website: str = ""
     evidence: list[str] | None = None
     api_requests: int = 0
+    from_cache: bool = False
 
     def __post_init__(self) -> None:
         if self.evidence is None:
@@ -113,6 +117,14 @@ def _phone_key(value: str) -> str:
 
 def _normalized_text(value: str) -> str:
     return " ".join(re.findall(r"[a-zа-яё0-9]+", (value or "").lower()))
+
+
+def domain_verification_key(lead: Lead) -> str:
+    phone = _phone_key(lead.phone)
+    parts = [_normalized_text(lead.name), _normalized_text(lead.city), phone]
+    if not phone:
+        parts.append(_normalized_text(lead.address))
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
 
 def candidate_matches(lead: Lead, html: str) -> tuple[bool, str]:
@@ -282,6 +294,41 @@ def verify_lead_site(
         return VerificationResult("verification_error", evidence=[f"ошибка проверки: {error}"], api_requests=1)
 
 
+def _cached_verification(lead: Lead, store: LeadStore) -> VerificationResult | None:
+    cached = store.get_domain_verification(domain_verification_key(lead))
+    if not cached:
+        return None
+    return VerificationResult(
+        status=str(cached["status"]),
+        website=str(cached["website"]),
+        evidence=list(cached["evidence"]),
+        from_cache=True,
+    )
+
+
+def verify_lead_site_cached(
+    lead: Lead,
+    api_key: str,
+    folder_id: str,
+    store: LeadStore,
+    force_refresh: bool = False,
+    session: requests.Session | None = None,
+) -> VerificationResult:
+    if not force_refresh:
+        cached = _cached_verification(lead, store)
+        if cached:
+            return cached
+    result = verify_lead_site(lead, api_key, folder_id, session)
+    if result.status in CACHEABLE_STATUSES:
+        store.save_domain_verification(
+            domain_verification_key(lead),
+            result.status,
+            result.website,
+            list(result.evidence or []),
+        )
+    return result
+
+
 def verify_missing_leads(
     leads: list[Lead],
     api_key: str,
@@ -289,8 +336,9 @@ def verify_missing_leads(
     max_requests: int,
     dry_run: bool = False,
     session: requests.Session | None = None,
+    store: LeadStore | None = None,
 ) -> tuple[list[Lead], dict[str, int]]:
-    stats = {"yandex_checked": 0, "sites_found": 0, "api_requests": 0}
+    stats = {"yandex_checked": 0, "sites_found": 0, "api_requests": 0, "cache_hits": 0}
     if dry_run:
         return leads, stats
 
@@ -304,7 +352,10 @@ def verify_missing_leads(
         )
         if lead.website and not broken_osm_site:
             continue
-        if not api_key or not folder_id:
+        result = _cached_verification(lead, store) if store else None
+        if result:
+            stats["cache_hits"] += 1
+        elif not api_key or not folder_id:
             if broken_osm_site:
                 lead.verification_evidence.append(
                     "актуальный домен не проверен: Yandex Search API не настроен"
@@ -313,7 +364,7 @@ def verify_missing_leads(
                 lead.verification_status = "ambiguous"
                 lead.verification_evidence = ["Yandex Search API не настроен; нужна ручная проверка"]
             continue
-        if remaining <= 0:
+        if result is None and remaining <= 0:
             if broken_osm_site:
                 lead.verification_evidence.append(
                     "актуальный домен не проверен: месячный лимит Yandex Search API исчерпан"
@@ -326,7 +377,19 @@ def verify_missing_leads(
         previous_source = lead.website_source
         previous_status = lead.verification_status
         previous_audit = lead.audit
-        result = verify_lead_site(lead, api_key, folder_id, session)
+        if result is None:
+            result = (
+                verify_lead_site_cached(
+                    lead,
+                    api_key,
+                    folder_id,
+                    store,
+                    force_refresh=True,
+                    session=session,
+                )
+                if store
+                else verify_lead_site(lead, api_key, folder_id, session)
+            )
         remaining -= result.api_requests
         stats["api_requests"] += result.api_requests
         stats["yandex_checked"] += result.api_requests
