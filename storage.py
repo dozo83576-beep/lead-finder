@@ -6,6 +6,8 @@ from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 
 from lead_finder import STATUSES, Lead, WebsiteAudit
+from crm import ensure_crm_schema
+from outreach import ensure_outreach_schema, sync_unknown_permissions
 
 
 class LeadStore:
@@ -127,6 +129,9 @@ class LeadStore:
                 )
                 """
             )
+            ensure_outreach_schema(connection)
+            ensure_crm_schema(connection)
+            sync_unknown_permissions(connection)
 
     def upsert_many(self, leads: list[Lead]) -> None:
         sql = """
@@ -189,6 +194,7 @@ class LeadStore:
         ]
         with self._connect() as connection:
             connection.executemany(sql, rows)
+            sync_unknown_permissions(connection, [lead.lead_key for lead in leads])
 
     def list_leads(self) -> list[Lead]:
         with self._connect() as connection:

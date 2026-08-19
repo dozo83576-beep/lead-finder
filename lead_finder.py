@@ -2,6 +2,7 @@ import csv
 import io
 import logging
 import re
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
@@ -13,6 +14,8 @@ from openpyxl import Workbook, load_workbook
 
 
 USER_AGENT = "lead-finder/2.0 (local client research tool)"
+FORMULA_PREFIXES = ("=", "+", "-", "@", "−")
+NUMERIC_CELL = re.compile(r"[+\-\u2212]?[\d\s()./,\-\u2212]+")
 SOCIAL_HOSTS = ("vk.com", "t.me", "telegram.me", "instagram.com", "facebook.com", "wa.me")
 OVERPASS_ENDPOINTS = (
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
@@ -712,6 +715,52 @@ def import_xlsx(path_or_file: str | io.BytesIO) -> list[Lead]:
         workbook.close()
 
 
+def strip_invisible_prefix(value: str) -> str:
+    """Снимает всё невидимое в начале строки.
+
+    Перечислять опасные кодпоинты списком бесполезно: за пробелами идут символы нулевой
+    ширины, за ними маркеры направления письма, за ними Tag-символы — список всегда
+    оказывается неполным. Поэтому проверяется свойство: пробел по `isspace()` либо
+    категория Unicode `Cf` (format), к которой относятся все невидимые управляющие.
+    """
+    for index, char in enumerate(value):
+        if not char.isspace() and unicodedata.category(char) != "Cf":
+            return value[index:]
+    return ""
+
+
+def sanitize_export_cell(value: Any) -> Any:
+    """Гасит формульную инъекцию при открытии выгрузки в Excel.
+
+    Имя компании приходит из OpenStreetMap и из пользовательского импорта, поэтому
+    значение вида `=HYPERLINK(...)` или `=cmd|'/c calc'!A1` иначе выполнится как формула
+    на машине оператора.
+
+    Опасный символ ищется после всего невидимого в начале строки. Google Sheets и
+    LibreOffice отбрасывают ведущие пробелы при импорте, поэтому строка с пробелом перед
+    `=cmd|...` — та же формула. Кроме обычного и неразрывного пробела снимаются символы
+    нулевой ширины и маркеры направления письма: `isspace()` их не признаёт, но формулу
+    от простого сравнения первого символа они прячут так же.
+
+    Телефоны и суммы остаются нетронутыми: `+7 343 000-00-01` состоит только из цифр и
+    разделителей и формулой стать не может.
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    meaningful = strip_invisible_prefix(value)
+    if not meaningful:
+        return value
+    # NFKC приводит полноширинные и надстрочные варианты триггеров к обычным.
+    # Сравнение по сырому виду их пропускало. Экранирование лишней записи безопаснее
+    # пропуска: цена ошибки — апостроф в ячейке, а не исполнение формулы.
+    probe = unicodedata.normalize("NFKC", meaningful)
+    if not probe.startswith(FORMULA_PREFIXES):
+        return value
+    if NUMERIC_CELL.fullmatch(probe):
+        return value
+    return "'" + value
+
+
 def lead_to_export_row(lead: Lead) -> dict[str, Any]:
     row = {
         "score": lead.score,
@@ -721,7 +770,7 @@ def lead_to_export_row(lead: Lead) -> dict[str, Any]:
     for field_name in EXPORT_FIELDS[3:]:
         value = getattr(lead, field_name)
         row[field_name] = "; ".join(value) if isinstance(value, list) else value
-    return row
+    return {key: sanitize_export_cell(value) for key, value in row.items()}
 
 
 def export_csv_bytes(leads: list[Lead]) -> bytes:

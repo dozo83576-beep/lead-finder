@@ -5,6 +5,7 @@ from urllib.parse import urlparse
 import pandas as pd
 import streamlit as st
 
+from crm_ui import render_lead_crm_summary
 from lead_finder import (
     PRESETS,
     STATUSES,
@@ -26,6 +27,7 @@ from lead_finder import (
     score_components,
 )
 from storage import LeadStore
+from outreach_ui import render_outreach_section
 from verification import (
     calculate_request_allowance,
     check_yandex_connection,
@@ -322,6 +324,8 @@ if selected.verification_evidence:
     st.write("**Доказательства:** " + "; ".join(selected.verification_evidence))
 contact_parts = [part for part in (selected.phone, selected.email, selected.social, selected.website) if part]
 st.write("**Контакты:** " + (" · ".join(contact_parts) if contact_parts else "не указаны"))
+if not st.session_state.dry_results:
+    render_lead_crm_summary(os.environ.get("LEAD_DB_PATH", "leads.db"), selected)
 if selected.source_url:
     st.link_button("Открыть источник", selected.source_url)
 st.link_button("Открыть ручной поиск в Яндексе", manual_yandex_search_url(selected))
@@ -488,5 +492,11 @@ if history:
             }
         )
         st.dataframe(history_table.drop(columns=["id"]), hide_index=True, width="stretch")
+
+render_outreach_section(
+    os.environ.get("LEAD_DB_PATH", "leads.db"),
+    leads,
+    bool(st.session_state.get("dry_results", False)),
+)
 
 st.markdown("Данные: © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright)")
