@@ -747,6 +747,14 @@ class OutreachStore:
             raise ValueError("Кампания не найдена.")
         current_limit = int(campaign["daily_limit"])
         max_limit = int(current_limit * 1.25)
+        if max_limit == current_limit:
+            # При лимите 1-3 четверть не набирает целого адресата. Рост здесь
+            # невозможен не из-за ошибки оператора, и сообщение должно это объяснять,
+            # а не выглядеть как отказ без причины.
+            raise ValueError(
+                f"При лимите {current_limit} рост на 25% не даёт целого адресата. "
+                "Создайте кампанию с бо́льшим стартовым лимитом."
+            )
         if new_limit <= current_limit or new_limit > max_limit:
             raise ValueError(f"Лимит можно увеличить максимум до {max_limit} адресатов в день.")
         current = (now or datetime.now(UTC)).astimezone(UTC)

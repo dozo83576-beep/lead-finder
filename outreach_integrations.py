@@ -26,6 +26,12 @@ from outreach import (
 UTC = timezone.utc
 
 
+LOGGER = logging.getLogger("lead_finder.outreach")
+IMAP_TIMEOUT_SECONDS = 30
+MAX_MESSAGE_BYTES = 1_000_000
+MAX_BODY_CHARS = 10_000
+
+
 class IntegrationError(RuntimeError):
     pass
 
@@ -307,8 +313,18 @@ def _recipient_address_for_message(store: OutreachStore, message_id: int) -> str
     return str(row["address"] or "") if row else ""
 
 
+def _open_imap(host: str) -> imaplib.IMAP4_SSL:
+    """Открывает IMAP-соединение с таймаутом.
+
+    Без таймаута зависший или медленный сервер блокирует worker в режиме `--loop`
+    навсегда: процесс не падает, поэтому в журнале не появляется ни строки, а
+    синхронизация ответов и авто-пауза кампании молча перестают работать.
+    """
+    return imaplib.IMAP4_SSL(host, timeout=IMAP_TIMEOUT_SECONDS)
+
+
 class ImapReplyClient:
-    def __init__(self, config: OutreachConfig, client_factory: Any = imaplib.IMAP4_SSL):
+    def __init__(self, config: OutreachConfig, client_factory: Any = _open_imap):
         self.config = config
         self.client_factory = client_factory
 
@@ -319,7 +335,13 @@ class ImapReplyClient:
     def sync(self, store: OutreachStore, limit: int = 100) -> int:
         self.validate()
         processed = 0
-        client = self.client_factory(self.config.imap_host)
+        try:
+            client = self.client_factory(self.config.imap_host)
+        except OSError as error:
+            # Таймаут и сетевые сбои — не подкласс imaplib.IMAP4.error. Без перевода
+            # в IntegrationError они пролетали бы мимо обработчиков worker и роняли
+            # --loop вместо того, чтобы пережить цикл и повторить позже.
+            raise IntegrationError("Не удалось подключиться к IMAP") from error
         try:
             client.login(self.config.imap_username, self.config.imap_password)
             status, _ = client.select("INBOX")
@@ -332,20 +354,69 @@ class ImapReplyClient:
             for message_number in ids:
                 status, raw_parts = client.fetch(message_number, "(RFC822)")
                 if status != "OK":
+                    # Сбой выборки может быть временным, поэтому письмо остаётся
+                    # непрочитанным и попадёт в следующий цикл.
+                    LOGGER.warning(
+                        "Письмо %s не удалось получить, попробуем в следующий раз",
+                        message_number.decode(errors="replace"),
+                    )
                     continue
                 raw = next(
                     (part[1] for part in raw_parts if isinstance(part, tuple) and len(part) > 1),
                     None,
                 )
+                if raw is not None and len(raw) > MAX_MESSAGE_BYTES:
+                    # Размером письма распоряжается отправитель, а ящик открыт для
+                    # любого. Обрезаем до лимита, но разбор продолжаем: отправитель и
+                    # Message-ID лежат в заголовках, поэтому ответ лида с тяжёлой
+                    # подписью или вложением всё равно остановит кампанию — теряется
+                    # только хвост тела, а не факт ответа.
+                    LOGGER.warning(
+                        "Письмо %s больше %s байт, тело обрезано",
+                        message_number.decode(errors="replace"),
+                        MAX_MESSAGE_BYTES,
+                    )
+                    raw = raw[:MAX_MESSAGE_BYTES]
                 if not raw:
+                    # Пустой ответ сам не исправится: помечаем прочитанным, иначе
+                    # письмо навсегда занимает место в окне UNSEEN. Номер остаётся
+                    # в журнале, чтобы оператор нашёл письмо в ящике руками.
+                    LOGGER.warning(
+                        "Письмо %s без содержимого, разберите вручную",
+                        message_number.decode(errors="replace"),
+                    )
+                    client.store(message_number, "+FLAGS", "\\Seen")
                     continue
-                message = email.message_from_bytes(raw)
-                event = parse_incoming_email(message)
+                try:
+                    message = email.message_from_bytes(raw)
+                    event = parse_incoming_email(message)
+                except Exception as error:
+                    # Перехват намеренно широкий. Письмо приходит от кого угодно, а
+                    # разбор идёт через email-пакет со своей иерархией исключений:
+                    # LookupError от неизвестной кодировки, HeaderParseError от битого
+                    # base64 в теме, CharsetError от неascii-имени кодировки — ни один
+                    # из них не наследуется от общего предка с остальными. Перечислять
+                    # типы значит каждый раз узнавать о новом из упавшего worker.
+                    # Письмо помечается прочитанным, чтобы не занять место в окне навсегда,
+                    # но его номер идёт в журнал: автоматика такой ответ не увидит,
+                    # и решение по нему принимает оператор.
+                    LOGGER.warning(
+                        "Письмо %s не разобрано (%s), проверьте его вручную",
+                        message_number.decode(errors="replace"),
+                        type(error).__name__,
+                    )
+                    client.store(message_number, "+FLAGS", "\\Seen")
+                    continue
                 if event["address"] == normalize_destination("email", self.config.sender_email):
                     client.store(message_number, "+FLAGS", "\\Seen")
                     continue
                 lead_key = store.find_lead_by_email(str(event["address"]))
                 if not lead_key:
+                    # Письмо от неизвестного адреса тоже помечается прочитанным.
+                    # Иначе оно навсегда остаётся в выборке UNSEEN, а она обрезается
+                    # по limit — накопившись, чужие письма вытеснят из окна реальные
+                    # ответы лидов, и цепочка продолжит идти уже ответившему человеку.
+                    client.store(message_number, "+FLAGS", "\\Seen")
                     continue
                 inserted = store.record_event(
                     "reply",
@@ -363,7 +434,9 @@ class ImapReplyClient:
                 if inserted:
                     processed += 1
                 client.store(message_number, "+FLAGS", "\\Seen")
-        except imaplib.IMAP4.error as error:
+        except (imaplib.IMAP4.error, OSError) as error:
+            # OSError покрывает socket.timeout и обрывы соединения на login/fetch:
+            # для worker это такая же временная помеха, как ошибка протокола.
             raise IntegrationError("Ошибка авторизации или синхронизации IMAP") from error
         finally:
             try:
@@ -393,7 +466,7 @@ def parse_incoming_email(message: Message) -> dict[str, object]:
         "address": normalize_destination("email", address),
         "from_name": str(make_header(decode_header(name))) if name else "",
         "subject": subject,
-        "body": _message_text(message)[:10000],
+        "body": _message_text(message)[:MAX_BODY_CHARS],
         "provider_event_id": f"imap:{message_id.strip()}",
         "occurred_at": occurred_at,
     }
@@ -406,12 +479,18 @@ def _message_text(message: Message) -> str:
                 continue
             payload = part.get_payload(decode=True)
             if payload is not None:
-                return payload.decode(part.get_content_charset() or "utf-8", errors="replace").strip()
+                return payload[:MAX_BODY_CHARS * 4].decode(
+                    part.get_content_charset() or "utf-8", errors="replace"
+                )[:MAX_BODY_CHARS].strip()
         return ""
     payload = message.get_payload(decode=True)
     if payload is None:
-        return str(message.get_payload() or "").strip()
-    return payload.decode(message.get_content_charset() or "utf-8", errors="replace").strip()
+        return str(message.get_payload() or "")[:MAX_BODY_CHARS].strip()
+    # Обрезаем до декодирования: расшифровывать мегабайты, чтобы затем оставить
+    # первые тысячи символов, — работа впустую за счёт отправителя.
+    return payload[:MAX_BODY_CHARS * 4].decode(
+        message.get_content_charset() or "utf-8", errors="replace"
+    )[:MAX_BODY_CHARS].strip()
 
 
 class TelegramBotClient:

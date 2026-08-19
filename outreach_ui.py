@@ -257,6 +257,11 @@ def render_outreach_section(db_path: str, leads: list[Lead], dry_results: bool =
                     st.error(str(error))
             if not ready:
                 st.caption("Отправка заблокирована: " + "; ".join(missing))
+            if int(campaign["daily_limit"]) < 4:
+                st.caption(
+                    f"Лимит {int(campaign['daily_limit'])} повысить нельзя: "
+                    "25% от него не дают целого адресата."
+                )
             if int(campaign["daily_limit"]) >= 4:
                 max_next_limit = int(int(campaign["daily_limit"]) * 1.25)
                 requested_limit = st.number_input(

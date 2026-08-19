@@ -436,6 +436,23 @@ class OutreachTests(unittest.TestCase):
             for failures in range(0, 12):
                 self.assertGreaterEqual(retry_delay(interval, failures), interval)
 
+    def test_small_daily_limit_cannot_grow_and_says_why(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, store, _ = self.make_store(os.path.join(tmp, "leads.db"))
+            now = datetime(2026, 7, 28, 5, 30, tzinfo=UTC)
+            campaign_id = store.create_campaign("Малый лимит", "no_site", daily_limit=3)
+            with store._connect() as connection:
+                connection.execute(
+                    "UPDATE outreach_campaigns SET created_at = ? WHERE id = ?",
+                    ((now - timedelta(days=8)).isoformat(), campaign_id),
+                )
+
+            # 25% от 3 не дают целого адресата: рост невозможен, и отказ это объясняет.
+            with self.assertRaises(ValueError) as error:
+                store.increase_daily_limit(campaign_id, 4, now)
+            self.assertIn("не даёт целого адресата", str(error.exception))
+            self.assertEqual(store.get_campaign(campaign_id)["daily_limit"], 3)
+
     def test_worker_never_sends_outside_campaign_window(self):
         with tempfile.TemporaryDirectory() as tmp:
             _, store, lead = self.make_store(os.path.join(tmp, "leads.db"))
