@@ -173,6 +173,13 @@ with st.sidebar:
             st.error("Не удалось прочитать заголовки файла.")
         if headers:
             suggested = guess_mapping(headers)
+            active_prefix = f"mapping_{uploaded.file_id}_"
+            for stale_key in [
+                key
+                for key in st.session_state
+                if key.startswith("mapping_") and not key.startswith(active_prefix)
+            ]:
+                del st.session_state[stale_key]
             with st.expander("Сопоставление колонок"):
                 st.caption(
                     "Название компании обязательно. Несколько выбранных колонок объединяются "
@@ -186,7 +193,9 @@ with st.sidebar:
                         headers,
                         default=guessed[:1] if single else guessed,
                         max_selections=1 if single else None,
-                        key=f"mapping_{mapping_field}",
+                        # Ключ привязан к файлу: иначе выбор для прошлого файла остался бы
+                        # в session_state, а подсказка для нового файла не применилась бы.
+                        key=f"mapping_{uploaded.file_id}_{mapping_field}",
                         help="Адрес рассылки должен остаться одним получателем." if single else None,
                     )
     import_clicked = st.button("Импортировать и проверить", key="import", width="stretch")
