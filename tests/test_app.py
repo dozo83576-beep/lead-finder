@@ -488,6 +488,35 @@ class LeadFinderAppTests(unittest.TestCase):
                 else:
                     os.environ["LEAD_LOG_PATH"] = old_log
 
+    def test_import_button_without_file_warns_and_does_not_import(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "app.db")
+            log_path = os.path.join(tmp, "app.log")
+            old_db = os.environ.get("LEAD_DB_PATH")
+            old_log = os.environ.get("LEAD_LOG_PATH")
+            os.environ["LEAD_DB_PATH"] = db_path
+            os.environ["LEAD_LOG_PATH"] = log_path
+            try:
+                with patch("lead_finder.import_csv") as import_call:
+                    app = AppTest.from_file(Path(__file__).parents[1] / "app.py", default_timeout=15).run()
+                    app.button(key="import").click().run()
+
+                import_call.assert_not_called()
+
+                self.assertFalse(app.exception)
+                self.assertTrue(any("Выберите CSV или XLSX" in item.value for item in app.warning))
+                self.assertEqual(LeadStore(db_path).list_leads(), [])
+            finally:
+                logging.shutdown()
+                if old_db is None:
+                    os.environ.pop("LEAD_DB_PATH", None)
+                else:
+                    os.environ["LEAD_DB_PATH"] = old_db
+                if old_log is None:
+                    os.environ.pop("LEAD_LOG_PATH", None)
+                else:
+                    os.environ["LEAD_LOG_PATH"] = old_log
+
     def test_three_queues_and_manual_confirmation(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = os.path.join(tmp, "app.db")

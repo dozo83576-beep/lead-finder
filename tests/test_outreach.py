@@ -110,6 +110,29 @@ class OutreachTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 store.upsert_permission(lead.lead_key, "email", lead.email, "consented")
 
+    def test_multi_address_email_cannot_be_consented_or_contacted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lead = confirmed_lead(email="first@example.ru, second@example.ru")
+            _, store, lead = self.make_store(os.path.join(tmp, "leads.db"), lead)
+
+            with self.assertRaises(ValueError):
+                store.upsert_permission(
+                    lead.lead_key,
+                    "email",
+                    lead.email,
+                    "consented",
+                    source="форма на сайте",
+                    evidence="запись opt-in №42",
+                    obtained_at=datetime.now(UTC).isoformat(),
+                )
+
+            self.assertFalse(store.can_contact(lead.lead_key, "email", lead.email))
+            campaign_id = store.create_campaign("Пилот", "no_site", daily_limit=5)
+            store.set_campaign_state(campaign_id, "approved")
+            store.set_campaign_state(campaign_id, "active")
+            with self.assertRaises(PermissionError):
+                store.enroll_recipient(campaign_id, lead)
+
     def test_unconfirmed_no_site_cannot_be_rendered(self):
         lead = confirmed_lead()
         lead.verification_status = "likely_no_site"

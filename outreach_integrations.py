@@ -18,6 +18,7 @@ from outreach import (
     OutreachConfig,
     OutreachStore,
     ProviderSendResult,
+    is_single_destination,
     normalize_destination,
     plain_text_to_html,
 )
@@ -106,6 +107,8 @@ class UnisenderProvider:
         contact_name: str = "",
     ) -> ProviderSendResult:
         destination = normalize_destination("email", address)
+        if not is_single_destination("email", destination):
+            raise PermissionError("Отправка заблокирована: в поле адреса больше одного получателя.")
         if not store.can_contact(lead_key, "email", destination):
             raise PermissionError("Отправка заблокирована: нет согласия или адрес подавлен.")
         gate_ready, missing = store.production_gate_ready()

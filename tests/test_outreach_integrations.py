@@ -117,6 +117,27 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(session.calls[2][1]["data"]["track_links"], 0)
         self.assertEqual(result.provider_campaign_id, "20")
 
+    def test_unisender_refuses_address_with_several_recipients(self):
+        config = OutreachConfig(
+            unisender_api_key="secret-key",
+            unisender_list_id="77",
+            sender_name="Иван",
+            sender_email="ivan@connect.example.ru",
+            reply_to="ivan@connect.example.ru",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            store, lead = self.make_store(os.path.join(tmp, "leads.db"))
+            self.enable(store, lead)
+            session = FakeSession([])
+            provider = UnisenderProvider(config, session=session)
+
+            with self.assertRaises(PermissionError):
+                provider.send_message(
+                    store, lead.lead_key, f"{lead.email}, other@example.ru", "Тема", "Текст"
+                )
+
+            self.assertEqual(session.calls, [])
+
     def test_parse_incoming_email_is_stable_without_message_id(self):
         message = EmailMessage()
         message["From"] = "Клиент <Owner@Example.ru>"

@@ -53,6 +53,39 @@ INPUT_FIELDS = (
     "source",
     "source_url",
 )
+COORDINATE_FIELDS = ("latitude", "longitude")
+# Адрес рассылки должен остаться одним получателем: провайдер разбивает список по запятой.
+SINGLE_VALUE_FIELDS = ("email",)
+MAPPING_FIELDS = INPUT_FIELDS + COORDINATE_FIELDS
+HEADER_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "name": ("name", "наименование", "название", "организация", "компания", "фирма", "company", "title"),
+    "category": ("рубрики", "рубрика", "категория", "категории", "виддеятельности", "сфера", "category"),
+    "city": ("город", "населенныйпункт", "city", "town"),
+    "address": ("адрес", "улица", "почтовыйадрес", "address", "street"),
+    "phone": ("телефон", "телефоны", "тел", "номертелефона", "контактныйтелефон", "phone", "tel", "mobile"),
+    "email": ("email", "почта", "электроннаяпочта", "mail"),
+    "website": ("вебсайт", "сайт", "адрессайта", "домен", "site", "website", "url", "web"),
+    "social": (
+        "соцсети",
+        "социальныесети",
+        "вконтакте",
+        "vk",
+        "instagram",
+        "telegram",
+        "whatsapp",
+        "viber",
+        "youtube",
+        "facebook",
+        "twitter",
+        "skype",
+        "social",
+    ),
+    "source": ("источник", "source"),
+    "source_url": ("ссылка", "ссылканаисточник", "ссылканакарточку", "карточка", "sourceurl", "link"),
+    "latitude": ("широта", "lat", "latitude"),
+    "longitude": ("долгота", "lon", "lng", "longitude"),
+}
+HEADER_NUMBER_SUFFIX = re.compile(r"\d+$")
 EXPORT_FIELDS = (
     "score",
     "priority",
@@ -656,6 +689,107 @@ def clean_cell(value: Any) -> str:
     return "" if value is None else str(value).strip()
 
 
+def normalize_header(value: Any) -> str:
+    """Приводит заголовок колонки к виду, по которому ищется поле лида.
+
+    Числовой суффикс отбрасывается, поэтому «Телефон 1» и «Телефон 2»
+    сопоставляются с одним и тем же полем и объединяются при импорте.
+    """
+    text = clean_cell(value).lower().replace("ё", "е")
+    return HEADER_NUMBER_SUFFIX.sub("", re.sub(r"[^0-9a-zа-я]+", "", text))
+
+
+def unique_headers(fieldnames: Any) -> list[str]:
+    """Делает заголовки уникальными, чтобы колонки не схлопывались в строке.
+
+    Две колонки «Телефон» стали бы одним ключом, и значение первой потерялось бы,
+    поэтому повторам добавляется номер: «Телефон», «Телефон (2)». Колонка без
+    заголовка получает имя по своей позиции — иначе безымянные схлопнулись бы так же.
+    """
+    used: set[str] = set()
+    result: list[str] = []
+    for position, header in enumerate(fieldnames or (), start=1):
+        name = clean_cell(header) or f"Колонка {position}"
+        candidate = name
+        number = 1
+        while candidate in used:
+            number += 1
+            candidate = f"{name} ({number})"
+        used.add(candidate)
+        result.append(candidate)
+    return result
+
+
+def guess_mapping(fieldnames: list[str]) -> dict[str, list[str]]:
+    """Сопоставляет заголовки файла с полями лида, сохраняя порядок колонок."""
+    synonyms: dict[str, str] = {}
+    for field_name, variants in HEADER_SYNONYMS.items():
+        for variant in variants:
+            synonyms.setdefault(variant, field_name)
+
+    mapping: dict[str, list[str]] = {}
+    for column in fieldnames:
+        header = clean_cell(column)
+        if not header:
+            continue
+        field_name = header if header in MAPPING_FIELDS else synonyms.get(normalize_header(header), "")
+        if not field_name:
+            continue
+        columns = mapping.setdefault(field_name, [])
+        if header not in columns:
+            columns.append(header)
+    return mapping
+
+
+def collect_value(row: dict[str, Any], columns: list[str], single: bool = False) -> str:
+    parts: list[str] = []
+    for column in columns:
+        value = clean_cell(row.get(column))
+        if value and value not in parts:
+            parts.append(value)
+    if single:
+        return parts[0] if parts else ""
+    return ", ".join(parts)
+
+
+def _to_coordinate(value: Any) -> float | None:
+    try:
+        return float(clean_cell(value).replace(",", "."))
+    except ValueError:
+        return None
+
+
+def _rewind(stream: Any) -> None:
+    seek = getattr(stream, "seek", None)
+    if callable(seek):
+        seek(0)
+
+
+def _csv_handle(path_or_file: str | io.BytesIO) -> tuple[Any, bool]:
+    if isinstance(path_or_file, str):
+        return open(path_or_file, newline="", encoding="utf-8-sig"), True
+    _rewind(path_or_file)
+    return io.StringIO(path_or_file.getvalue().decode("utf-8-sig")), False
+
+
+def read_headers(path_or_file: str | io.BytesIO, kind: str) -> list[str]:
+    """Читает заголовки файла и возвращает поток в исходную позицию."""
+    if kind == "csv":
+        handle, close = _csv_handle(path_or_file)
+        try:
+            return unique_headers(next(csv.reader(handle), []))
+        finally:
+            if close:
+                handle.close()
+
+    workbook = load_workbook(path_or_file, read_only=True, data_only=True)
+    try:
+        return unique_headers(next(workbook.worksheets[0].iter_rows(values_only=True), None))
+    finally:
+        workbook.close()
+        _rewind(path_or_file)
+
+
 def _fallback_key(values: dict[str, str]) -> str:
     contact = values.get("phone") or values.get("email")
     if contact:
@@ -665,49 +799,63 @@ def _fallback_key(values: dict[str, str]) -> str:
     return f"import:{token}"
 
 
-def lead_from_row(row: dict[str, Any]) -> Lead | None:
-    values = {field: clean_cell(row.get(field)) for field in INPUT_FIELDS}
+def lead_from_row(row: dict[str, Any], mapping: dict[str, list[str]] | None = None) -> Lead | None:
+    if mapping is None:
+        values = {field: clean_cell(row.get(field)) for field in INPUT_FIELDS}
+        latitude = longitude = None
+    else:
+        values = {
+            field: collect_value(row, mapping.get(field, []), single=field in SINGLE_VALUE_FIELDS)
+            for field in INPUT_FIELDS
+        }
+        latitude = _to_coordinate(collect_value(row, mapping.get("latitude", [])))
+        longitude = _to_coordinate(collect_value(row, mapping.get("longitude", [])))
     if not values["name"]:
         return None
     return Lead(
         lead_key=_fallback_key(values),
         **values,
+        latitude=latitude,
+        longitude=longitude,
         website_source=values["source"] if values["website"] else "",
         verification_status="source_provided" if values["website"] else "ambiguous",
     )
 
 
-def import_csv(path_or_file: str | io.BytesIO) -> list[Lead]:
-    if isinstance(path_or_file, str):
-        handle = open(path_or_file, newline="", encoding="utf-8-sig")
-        close = True
-    else:
-        handle = io.StringIO(path_or_file.getvalue().decode("utf-8-sig"))
-        close = False
+def import_csv(path_or_file: str | io.BytesIO, mapping: dict[str, list[str]] | None = None) -> list[Lead]:
+    handle, close = _csv_handle(path_or_file)
     try:
-        reader = csv.DictReader(handle)
-        if not reader.fieldnames or "name" not in reader.fieldnames:
+        reader = csv.reader(handle)
+        fieldnames = unique_headers(next(reader, []))
+        resolved = mapping if mapping is not None else guess_mapping(fieldnames)
+        if not resolved.get("name"):
             raise ValueError("Во входном CSV обязательна колонка name.")
-        return [lead for row in reader if (lead := lead_from_row(row))]
+        return [
+            lead
+            for values in reader
+            if (lead := lead_from_row(dict(zip(fieldnames, values)), resolved))
+        ]
     finally:
         if close:
             handle.close()
 
 
-def import_xlsx(path_or_file: str | io.BytesIO) -> list[Lead]:
+def import_xlsx(path_or_file: str | io.BytesIO, mapping: dict[str, list[str]] | None = None) -> list[Lead]:
+    _rewind(path_or_file)
     workbook = load_workbook(path_or_file, read_only=True, data_only=True)
     try:
         rows = workbook.worksheets[0].iter_rows(values_only=True)
         headers = next(rows, None)
         if not headers:
             raise ValueError("Во входном XLSX обязательна колонка name.")
-        fieldnames = [clean_cell(header) for header in headers]
-        if "name" not in fieldnames:
+        fieldnames = unique_headers(headers)
+        resolved = mapping if mapping is not None else guess_mapping(fieldnames)
+        if not resolved.get("name"):
             raise ValueError("Во входном XLSX обязательна колонка name.")
         result = []
         for values in rows:
             row = {fieldnames[index]: value for index, value in enumerate(values) if index < len(fieldnames)}
-            lead = lead_from_row(row)
+            lead = lead_from_row(row, resolved)
             if lead:
                 result.append(lead)
         return result

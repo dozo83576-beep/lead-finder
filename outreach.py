@@ -273,6 +273,19 @@ def normalize_destination(channel: str, address: str) -> str:
     return value
 
 
+def is_single_destination(channel: str, address: str) -> bool:
+    """Проверяет, что адрес — ровно один получатель.
+
+    Провайдер рассылки трактует запятую в списке получателей как разделитель,
+    поэтому строка из нескольких адресов прошла бы проверку согласия целиком,
+    а письмо ушло бы каждому адресу по отдельности.
+    """
+    value = normalize_destination(channel, address)
+    if not value or any(separator in value for separator in (",", ";", " ", "\t", "\n")):
+        return False
+    return value.count("@") == 1 if channel == "email" else True
+
+
 def sync_unknown_permissions(
     connection: sqlite3.Connection,
     lead_keys: list[str] | None = None,
@@ -515,6 +528,8 @@ class OutreachStore:
         destination = normalize_destination(channel, address)
         if not destination:
             raise ValueError("Не указан адрес контакта.")
+        if status in ALLOWED_PERMISSION_STATUSES and not is_single_destination(channel, destination):
+            raise ValueError("Согласие даётся на один адрес: уберите лишние адреса из поля контакта.")
         if status == "consented" and not (source.strip() and evidence.strip() and obtained_at):
             raise ValueError("Для согласия нужны источник, доказательство и дата получения.")
         if status == "inbound" and not obtained_at:
@@ -585,6 +600,8 @@ class OutreachStore:
         return [dict(row) for row in rows]
 
     def can_contact(self, lead_key: str, channel: str, address: str) -> bool:
+        if not is_single_destination(channel, address):
+            return False
         permission = self.get_permission(lead_key, channel, address)
         return (
             permission["status"] in ALLOWED_PERMISSION_STATUSES
