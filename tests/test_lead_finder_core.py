@@ -18,6 +18,9 @@ from lead_finder import (
     overpass_source_limit,
     parse_osm_elements,
     render_outreach,
+    export_csv_bytes,
+    sanitize_export_cell,
+    strip_invisible_prefix,
     score_lead,
     score_components,
 )
@@ -449,6 +452,85 @@ class LeadFinderCoreTests(unittest.TestCase):
         text = render_outreach(lead, WebsiteAudit(state="missing"), "message")
 
         self.assertIn("в открытой карточке не указан сайт", text)
+
+
+    def test_fullwidth_formula_triggers_are_escaped(self):
+        # Полноширинные варианты триггеров экранируем независимо от локали читателя.
+        for trigger in ("＝", "＋", "－", "＠"):
+            payload = trigger + "cmd|'/c calc'!A1"
+            self.assertTrue(sanitize_export_cell(payload).startswith("'"), payload)
+
+        # Невидимый префикс вместе с полноширинным триггером — тоже атака.
+        combined = "​＝cmd|calc"
+        self.assertTrue(sanitize_export_cell(combined).startswith("'"))
+
+        # Надстрочный и типографский минус NFKC сводит к U+2212 — тоже триггер.
+        for trigger in ("⁻", "₋", "−"):
+            payload = trigger + "cmd|'/c calc'!A1"
+            self.assertTrue(sanitize_export_cell(payload).startswith("'"), payload)
+
+        # Числа и телефоны формулой не становятся ни в полноширинной записи,
+        # ни с типографским минусом, который NFKC оставляет как U+2212.
+        for value in ("＋７ 343 000-00-01", "－12,5", "−1 234,56", "⁻12,5"):
+            self.assertEqual(sanitize_export_cell(value), value)
+
+    def test_invisible_prefix_is_stripped_by_property_not_by_codepoint_list(self):
+        import unicodedata
+
+        # Берём произвольные символы категории Cf, которых нет ни в одном ручном списке.
+        exotic = [chr(code) for code in (0x00ad, 0x061c, 0x180e, 0x2064, 0x2069, 0xe0041)]
+        self.assertTrue(all(unicodedata.category(char) == "Cf" for char in exotic))
+        for char in exotic:
+            self.assertEqual(strip_invisible_prefix(char + "=cmd"), "=cmd")
+            self.assertTrue(sanitize_export_cell(char + "=cmd").startswith("'"))
+
+        self.assertEqual(strip_invisible_prefix("   "), "")
+        self.assertEqual(strip_invisible_prefix("Мастер окон"), "Мастер окон")
+
+    def test_export_neutralizes_formula_injection_but_keeps_phones(self):
+        hostile = Lead(
+            name="=cmd|'/c calc'!A1",
+            lead_key="hostile",
+            phone="+79001234567",
+            city="@SUM(1+1)",
+        )
+
+        text = export_csv_bytes([hostile]).decode("utf-8-sig")
+
+        self.assertIn("'=cmd|'/c calc'!A1", text)
+        self.assertIn("'@SUM(1+1)", text)
+        self.assertIn("+79001234567", text)
+        self.assertNotIn("'+79001234567", text)
+        self.assertEqual(sanitize_export_cell("-12.5"), "-12.5")
+        self.assertEqual(sanitize_export_cell("обычное имя"), "обычное имя")
+        self.assertEqual(sanitize_export_cell(42), 42)
+
+    def test_export_keeps_real_phone_formats_and_catches_leading_space(self):
+        # Именно такой формат телефона отдаёт собственный Dry Run приложения.
+        for phone in ("+7 343 000-00-01", "+7 (343) 000-00-01", "8-800-555-35-35", "-1 234,56"):
+            self.assertEqual(sanitize_export_cell(phone), phone)
+
+        # Google Sheets и LibreOffice отбрасывают ведущий пробел, формула оживает.
+        # Неразрывный пробел, символы нулевой ширины и маркеры направления письма
+        # прячут формулу от сравнения первого символа — снимаем и их.
+        for attack in (
+            " =cmd|'/c calc'!A1",
+            "\t=HYPERLINK(\"http://evil\")",
+            "  @SUM(1+1)",
+            " =cmd|'/c calc'!A1",
+            " @SUM(1+1)",
+            "​=cmd|'/c calc'!A1",
+            "‏=HYPERLINK(\"http://evil\")",
+            "﻿@SUM(1+1)",
+            "‮=cmd|'/c calc'!A1",
+            "⁦@SUM(1+1)",
+            "­=cmd|calc",
+            "؜=cmd|calc",
+            "⁡=cmd|calc",
+            "󠀠=cmd|calc",
+            " ​‮­ =cmd|calc",
+        ):
+            self.assertTrue(sanitize_export_cell(attack).startswith("'"), attack)
 
 
 if __name__ == "__main__":

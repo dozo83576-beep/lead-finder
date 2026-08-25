@@ -7,3 +7,8 @@ __pycache__/
 *.sqlite*
 *.log
 .lead_finder.pid
+
+career_pack_*/
+.codex-tmp/
+*.docx
+*.pdf

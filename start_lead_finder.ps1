@@ -25,6 +25,22 @@ try {
 
     $env:YANDEX_SEARCH_API_KEY = [Environment]::GetEnvironmentVariable('YANDEX_SEARCH_API_KEY', 'User')
     $env:YANDEX_FOLDER_ID = [Environment]::GetEnvironmentVariable('YANDEX_FOLDER_ID', 'User')
+    $outreachVariables = @(
+        'UNISENDER_API_KEY',
+        'UNISENDER_LIST_ID',
+        'OUTREACH_SENDER_NAME',
+        'OUTREACH_FROM_EMAIL',
+        'OUTREACH_REPLY_TO',
+        'OUTREACH_IMAP_HOST',
+        'OUTREACH_IMAP_USERNAME',
+        'OUTREACH_IMAP_PASSWORD',
+        'TELEGRAM_BOT_TOKEN',
+        'TELEGRAM_BOT_USERNAME',
+        'OUTREACH_LINK_SECRET'
+    )
+    foreach ($variableName in $outreachVariables) {
+        Set-Item -Path "Env:$variableName" -Value ([Environment]::GetEnvironmentVariable($variableName, 'User'))
+    }
     $launcher = (Get-Command py.exe -ErrorAction Stop).Source
     $process = Start-Process -FilePath $launcher `
         -ArgumentList @("-3.14", "-m", "streamlit", "run", "app.py", "--server.headless=true", "--server.port=$port", "--browser.gatherUsageStats=false") `

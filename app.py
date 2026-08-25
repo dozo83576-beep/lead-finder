@@ -1,12 +1,17 @@
 import logging
 import os
 from urllib.parse import urlparse
+from zipfile import BadZipFile
 
 import pandas as pd
 import streamlit as st
+from openpyxl.utils.exceptions import InvalidFileException
 
+from crm_ui import render_lead_crm_summary
 from lead_finder import (
+    MAPPING_FIELDS,
     PRESETS,
+    SINGLE_VALUE_FIELDS,
     STATUSES,
     Lead,
     WebsiteAudit,
@@ -17,15 +22,18 @@ from lead_finder import (
     export_csv_bytes,
     export_xlsx_bytes,
     filter_and_limit_leads,
+    guess_mapping,
     import_csv,
     import_xlsx,
     lead_queue,
+    read_headers,
     normalize_website,
     render_outreach,
     resolve_city_bbox,
     score_components,
 )
 from storage import LeadStore
+from outreach_ui import render_outreach_section
 from verification import (
     calculate_request_allowance,
     check_yandex_connection,
@@ -38,6 +46,22 @@ from verification import (
 )
 
 
+# Разбор загруженного файла: openpyxl бросает свои типы, не наследующие OSError.
+FILE_ERRORS = (OSError, ValueError, KeyError, BadZipFile, InvalidFileException)
+MAPPING_LABELS = {
+    "name": "Название компании",
+    "category": "Категория",
+    "city": "Город",
+    "address": "Адрес",
+    "phone": "Телефон",
+    "email": "Email",
+    "social": "Соцсети",
+    "website": "Сайт",
+    "source": "Источник",
+    "source_url": "Ссылка на источник",
+    "latitude": "Широта",
+    "longitude": "Долгота",
+}
 VERIFICATION_LABELS = {
     "source_provided": "Сайт указан в источнике",
     "site_found": "Сайт найден и сопоставлен",
@@ -139,6 +163,41 @@ with st.sidebar:
 
     st.divider()
     uploaded = st.file_uploader("Импорт CSV или XLSX", type=["csv", "xlsx"], key="upload")
+    column_mapping: dict[str, list[str]] = {}
+    if uploaded is not None:
+        headers: list[str] = []
+        try:
+            headers = read_headers(uploaded, "csv" if uploaded.name.lower().endswith(".csv") else "xlsx")
+        except FILE_ERRORS as error:
+            logging.error("Заголовки файла не прочитаны: %s", error)
+            st.error("Не удалось прочитать заголовки файла.")
+        if headers:
+            suggested = guess_mapping(headers)
+            active_prefix = f"mapping_{uploaded.file_id}_"
+            for stale_key in [
+                key
+                for key in st.session_state
+                if key.startswith("mapping_") and not key.startswith(active_prefix)
+            ]:
+                del st.session_state[stale_key]
+            with st.expander("Сопоставление колонок"):
+                st.caption(
+                    "Название компании обязательно. Несколько выбранных колонок объединяются "
+                    "через запятую, кроме email: он берётся из одной колонки."
+                )
+                for mapping_field in MAPPING_FIELDS:
+                    single = mapping_field in SINGLE_VALUE_FIELDS
+                    guessed = suggested.get(mapping_field, [])
+                    column_mapping[mapping_field] = st.multiselect(
+                        MAPPING_LABELS[mapping_field],
+                        headers,
+                        default=guessed[:1] if single else guessed,
+                        max_selections=1 if single else None,
+                        # Ключ привязан к файлу: иначе выбор для прошлого файла остался бы
+                        # в session_state, а подсказка для нового файла не применилась бы.
+                        key=f"mapping_{uploaded.file_id}_{mapping_field}",
+                        help="Адрес рассылки должен остаться одним получателем." if single else None,
+                    )
     import_clicked = st.button("Импортировать и проверить", key="import", width="stretch")
 
     st.divider()
@@ -235,9 +294,17 @@ if search_clicked:
 if import_clicked:
     if uploaded is None:
         st.warning("Выберите CSV или XLSX.")
+    elif not column_mapping:
+        st.error("Не удалось прочитать заголовки файла.")
+    elif not column_mapping.get("name"):
+        st.warning("Укажите колонку с названием компании.")
     else:
         try:
-            imported = import_csv(uploaded) if uploaded.name.lower().endswith(".csv") else import_xlsx(uploaded)
+            imported = (
+                import_csv(uploaded, column_mapping)
+                if uploaded.name.lower().endswith(".csv")
+                else import_xlsx(uploaded, column_mapping)
+            )
             enriched = enrich_leads(
                 imported,
                 pagespeed_key=os.environ.get("PAGESPEED_API_KEY", ""),
@@ -248,9 +315,9 @@ if import_clicked:
             st.session_state.dry_results = False
             logging.info("Импорт завершён: сохранено %s лидов.", len(enriched))
             st.success(f"Импортировано и проверено: {len(enriched)}")
-        except (OSError, ValueError) as error:
+        except FILE_ERRORS as error:
             logging.error("Импорт не выполнен: %s", error)
-            st.error(str(error))
+            st.error(str(error) or "Файл не прочитан.")
 
 leads: list[Lead] = [
     lead
@@ -322,6 +389,8 @@ if selected.verification_evidence:
     st.write("**Доказательства:** " + "; ".join(selected.verification_evidence))
 contact_parts = [part for part in (selected.phone, selected.email, selected.social, selected.website) if part]
 st.write("**Контакты:** " + (" · ".join(contact_parts) if contact_parts else "не указаны"))
+if not st.session_state.dry_results:
+    render_lead_crm_summary(os.environ.get("LEAD_DB_PATH", "leads.db"), selected)
 if selected.source_url:
     st.link_button("Открыть источник", selected.source_url)
 st.link_button("Открыть ручной поиск в Яндексе", manual_yandex_search_url(selected))
@@ -488,5 +557,11 @@ if history:
             }
         )
         st.dataframe(history_table.drop(columns=["id"]), hide_index=True, width="stretch")
+
+render_outreach_section(
+    os.environ.get("LEAD_DB_PATH", "leads.db"),
+    leads,
+    bool(st.session_state.get("dry_results", False)),
+)
 
 st.markdown("Данные: © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright)")
